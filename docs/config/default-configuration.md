@@ -44,6 +44,9 @@ view_distance = 2
 # Path to schematic file for custom world structures
 # Leave empty to disable schematic loading
 schematic_file = ""
+# Path to Polar file for custom world structures
+# Leave empty to disable Polar loading
+polar_file = ""
 # Lock the time in the world to `world.time` value
 lock_time = false
 

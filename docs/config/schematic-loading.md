@@ -39,6 +39,29 @@ schematic_file = ""
 ```
 :::
 
+## Polar File
+
+Load `.polar` files (Minestom Polar world format) to customize the spawn location.
+
+:::code-group
+```toml [server.toml] {2}
+[world.experimental]
+polar_file = "spawn.polar"
+```
+:::
+
+To disable Polar loading:
+
+:::code-group
+```toml [server.toml] {2}
+[world.experimental]
+polar_file = ""
+```
+:::
+
+> [!IMPORTANT]
+> Set either `schematic_file` or `polar_file`, not both at the same time.
+
 ### Known Limitations
 
 Here's a list of what does not work when loading a schematic:

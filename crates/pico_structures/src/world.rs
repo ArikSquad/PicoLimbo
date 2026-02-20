@@ -1,10 +1,13 @@
 use crate::chunk_processor::{ChunkProcessor, ChunkProcessorError};
 use crate::internal_block_entity::BlockEntity;
 use crate::palette::Palette;
+use crate::polar::{PolarError, read_polar_world};
 use crate::prelude::Schematic;
+use blocks_report::InternalMapping;
 use minecraft_protocol::prelude::Coordinates;
 use rayon::iter::ParallelIterator;
 use rayon::prelude::IntoParallelIterator;
+use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 use thiserror::Error;
 
@@ -18,6 +21,9 @@ pub type SkyLightSection = LightSection;
 pub struct World {
     world_sections: Vec<Palette>,
     size_in_chunks: Coordinates,
+    chunk_origin_x: i32,
+    section_origin_y: i32,
+    chunk_origin_z: i32,
     block_entities_by_chunk: Vec<Vec<BlockEntity>>,
     /// Sky light data indexed by chunk column (x, z), containing light for all Y sections
     sky_light_by_chunk: Vec<Vec<LightSection>>,
@@ -29,9 +35,40 @@ pub struct World {
 pub enum WorldLoadingError {
     #[error(transparent)]
     ChunkProcessor(#[from] ChunkProcessorError),
+    #[error(transparent)]
+    Polar(#[from] PolarError),
 }
 
 impl World {
+    pub fn from_polar_file(
+        path: &Path,
+        internal_mapping: &InternalMapping,
+    ) -> Result<Self, WorldLoadingError> {
+        Ok(read_polar_world(path, internal_mapping)?)
+    }
+
+    pub(crate) fn from_parts(
+        world_sections: Vec<Palette>,
+        size_in_chunks: Coordinates,
+        block_entities_by_chunk: Vec<Vec<BlockEntity>>,
+        sky_light_by_chunk: Vec<Vec<LightSection>>,
+        block_light_by_chunk: Vec<Vec<LightSection>>,
+        chunk_origin_x: i32,
+        section_origin_y: i32,
+        chunk_origin_z: i32,
+    ) -> Self {
+        Self {
+            world_sections,
+            size_in_chunks,
+            chunk_origin_x,
+            section_origin_y,
+            chunk_origin_z,
+            block_entities_by_chunk,
+            sky_light_by_chunk,
+            block_light_by_chunk,
+        }
+    }
+
     pub fn from_schematic(schematic: &Schematic) -> Result<Self, WorldLoadingError> {
         let dimensions = schematic.get_dimensions();
         let size_in_chunks = (dimensions + 15) / 16;
@@ -73,13 +110,16 @@ impl World {
         let (sky_light_by_chunk, block_light_by_chunk) =
             Self::calculate_global_light(schematic, size_in_chunks, chunk_column_count);
 
-        Ok(Self {
-            world_sections: world_sections?,
+        Ok(Self::from_parts(
+            world_sections?,
             size_in_chunks,
             block_entities_by_chunk,
             sky_light_by_chunk,
             block_light_by_chunk,
-        })
+            0,
+            0,
+            0,
+        ))
     }
 
     /// Calculate both sky light and block light for the entire schematic at once.
@@ -367,25 +407,27 @@ impl World {
 
     /// Check if chunk column coordinates (x, z) are within bounds.
     fn is_chunk_column_in_bounds(&self, chunk_x: i32, chunk_z: i32) -> bool {
-        chunk_x >= 0
-            && chunk_x < self.size_in_chunks.x()
-            && chunk_z >= 0
-            && chunk_z < self.size_in_chunks.z()
+        chunk_x >= self.chunk_origin_x
+            && chunk_x < self.chunk_origin_x + self.size_in_chunks.x()
+            && chunk_z >= self.chunk_origin_z
+            && chunk_z < self.chunk_origin_z + self.size_in_chunks.z()
     }
 
     /// Check if section coordinates (x, y, z) are within bounds.
     fn is_section_in_bounds(&self, chunk_coords: &Coordinates) -> bool {
-        chunk_coords.x() >= 0
-            && chunk_coords.x() < self.size_in_chunks.x()
-            && chunk_coords.y() >= 0
-            && chunk_coords.y() < self.size_in_chunks.y()
-            && chunk_coords.z() >= 0
-            && chunk_coords.z() < self.size_in_chunks.z()
+        chunk_coords.x() >= self.chunk_origin_x
+            && chunk_coords.x() < self.chunk_origin_x + self.size_in_chunks.x()
+            && chunk_coords.y() >= self.section_origin_y
+            && chunk_coords.y() < self.section_origin_y + self.size_in_chunks.y()
+            && chunk_coords.z() >= self.chunk_origin_z
+            && chunk_coords.z() < self.chunk_origin_z + self.size_in_chunks.z()
     }
 
     /// Get the chunk column index for the given (x, z) coordinates.
     fn get_chunk_column_index(&self, chunk_x: i32, chunk_z: i32) -> usize {
-        (chunk_z + chunk_x * self.size_in_chunks.z()) as usize
+        let local_x = chunk_x - self.chunk_origin_x;
+        let local_z = chunk_z - self.chunk_origin_z;
+        (local_z + local_x * self.size_in_chunks.z()) as usize
     }
 
     pub fn get_section(&self, chunk_coords: &Coordinates) -> Option<&Palette> {
@@ -393,9 +435,13 @@ impl World {
             return None;
         }
 
-        let index = chunk_coords.z()
-            + (chunk_coords.y() * self.size_in_chunks.z())
-            + (chunk_coords.x() * self.size_in_chunks.y() * self.size_in_chunks.z());
+        let local_x = chunk_coords.x() - self.chunk_origin_x;
+        let local_y = chunk_coords.y() - self.section_origin_y;
+        let local_z = chunk_coords.z() - self.chunk_origin_z;
+
+        let index = local_z
+            + (local_y * self.size_in_chunks.z())
+            + (local_x * self.size_in_chunks.y() * self.size_in_chunks.z());
 
         self.world_sections.get(index as usize)
     }

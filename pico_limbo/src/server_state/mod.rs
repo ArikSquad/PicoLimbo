@@ -288,6 +288,7 @@ pub struct ServerStateBuilder {
     spawn_rotation: (f32, f32),
     view_distance: i32,
     schematic_file_path: String,
+    polar_file_path: String,
     boundaries: Option<Boundaries>,
     tab_list: Option<TabList>,
     fetch_player_skins: bool,
@@ -321,6 +322,8 @@ pub enum ServerStateBuilderError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     TryFromInt(#[from] TryFromIntError),
+    #[error("world.experimental.schematic_file and world.experimental.polar_file cannot both be set")]
+    ConflictingWorldFormats,
 }
 
 impl ServerStateBuilder {
@@ -461,6 +464,11 @@ impl ServerStateBuilder {
         self
     }
 
+    pub fn polar(&mut self, polar_file_path: String) -> &mut Self {
+        self.polar_file_path = polar_file_path;
+        self
+    }
+
     pub fn tab_list(
         &mut self,
         header: &str,
@@ -576,16 +584,29 @@ impl ServerStateBuilder {
 
     /// Finish building, returning an error if any required fields are missing.
     pub fn build(self) -> Result<ServerState, ServerStateBuilderError> {
-        let world = if self.schematic_file_path.is_empty() {
-            None
-        } else {
+        if !self.schematic_file_path.is_empty() && !self.polar_file_path.is_empty() {
+            return Err(ServerStateBuilderError::ConflictingWorldFormats);
+        }
+
+        let world = if !self.schematic_file_path.is_empty() {
             let schematic = time_operation("Loading schematic", || {
                 let internal_mapping = blocks_report::load_internal_mapping()?;
                 let schematic_file_path = PathBuf::from(self.schematic_file_path);
                 Schematic::load_schematic_file(&schematic_file_path, &internal_mapping)
             })?;
+
             let world = time_operation("Loading world", || World::from_schematic(&schematic))?;
             Some(Arc::new(world))
+        } else if !self.polar_file_path.is_empty() {
+            let internal_mapping = blocks_report::load_internal_mapping()?;
+            let world = time_operation("Loading polar world", || {
+                let polar_file_path = PathBuf::from(self.polar_file_path);
+                World::from_polar_file(&polar_file_path, &internal_mapping)
+            })?;
+
+            Some(Arc::new(world))
+        } else {
+            None
         };
 
         Ok(ServerState {
