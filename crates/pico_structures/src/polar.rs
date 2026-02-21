@@ -236,22 +236,14 @@ fn read_chunk(
         let legacy_named_nbt = version <= POLAR_VERSION_MINESTOM_NBT_READ_BREAK;
         if has_nbt {
             let nbt = read_nbt(reader, legacy_named_nbt)?;
-            if let Some(entity) = parse_block_entity(
-                chunk_x,
-                chunk_z,
-                chunk_pos_index,
-                block_entity_id,
-                nbt,
-            ) {
+            if let Some(entity) =
+                parse_block_entity(chunk_x, chunk_z, chunk_pos_index, block_entity_id, nbt)
+            {
                 block_entities.push(entity);
             }
-        } else if let Some(entity) = parse_block_entity(
-            chunk_x,
-            chunk_z,
-            chunk_pos_index,
-            block_entity_id,
-            None,
-        ) {
+        } else if let Some(entity) =
+            parse_block_entity(chunk_x, chunk_z, chunk_pos_index, block_entity_id, None)
+        {
             block_entities.push(entity);
         }
     }

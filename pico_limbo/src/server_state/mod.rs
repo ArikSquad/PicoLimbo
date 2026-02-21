@@ -322,7 +322,9 @@ pub enum ServerStateBuilderError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     TryFromInt(#[from] TryFromIntError),
-    #[error("world.experimental.schematic_file and world.experimental.polar_file cannot both be set")]
+    #[error(
+        "world.experimental.schematic_file and world.experimental.polar_file cannot both be set"
+    )]
     ConflictingWorldFormats,
 }
 

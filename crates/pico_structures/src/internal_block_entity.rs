@@ -154,11 +154,9 @@ impl BlockEntityData {
                 Self::Sign(Box::new(SignBlockEntity::from_nbt(entity_nbt)))
             }
 
-            _ => {
-                Self::Generic {
-                    entity: GenericBlockEntity::from_nbt(entity_nbt),
-                }
-            }
+            _ => Self::Generic {
+                entity: GenericBlockEntity::from_nbt(entity_nbt),
+            },
         }
     }
 
