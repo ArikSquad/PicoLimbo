@@ -136,6 +136,10 @@ impl ChunkData {
             return (block_entities, v1_18_block_entities);
         };
 
+        if entities.is_empty() {
+            return (block_entities, v1_18_block_entities);
+        };
+
         // Iterate through all block entities
         for entity_data in entities {
             let Some(protocol_id) =

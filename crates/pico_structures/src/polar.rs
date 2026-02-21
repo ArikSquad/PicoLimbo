@@ -5,6 +5,7 @@ use crate::world::{LightSection, World};
 use blocks_report::{BlockStateLookup, InternalId, InternalMapping};
 use minecraft_protocol::prelude::{Coordinates, VarInt};
 use pico_binutils::prelude::{BinaryReader, BinaryReaderError};
+use pico_nbt::prelude::Nbt;
 use std::path::Path;
 use thiserror::Error;
 use tracing::warn;
@@ -129,7 +130,6 @@ pub fn read_polar_world(
             &mut payload_reader,
             version,
             section_count,
-            min_section,
             &block_lookup,
             air,
         )?);
@@ -200,7 +200,6 @@ fn read_chunk(
     reader: &mut BinaryReader,
     version: i16,
     section_count: usize,
-    min_section: i32,
     block_lookup: &BlockStateLookup,
     air: InternalId,
 ) -> Result<ParsedChunk, PolarError> {
@@ -223,10 +222,10 @@ fn read_chunk(
         return Err(PolarError::InvalidFormat("negative block entity count"));
     }
 
-    let mut block_entities = Vec::new();
+    let mut block_entities = Vec::with_capacity(block_entity_count as usize);
     for _ in 0..block_entity_count {
-        let _ = reader.read::<i32>()?;
-        let _ = read_optional_string(reader)?;
+        let chunk_pos_index = reader.read::<i32>()?;
+        let block_entity_id = read_optional_string(reader)?;
 
         let has_nbt = if version <= POLAR_VERSION_USERDATA_OPT_BLOCK_ENT_NBT {
             true
@@ -234,9 +233,26 @@ fn read_chunk(
             read_bool(reader)?
         };
 
+        let legacy_named_nbt = version <= POLAR_VERSION_MINESTOM_NBT_READ_BREAK;
         if has_nbt {
-            let legacy_named_nbt = version <= POLAR_VERSION_MINESTOM_NBT_READ_BREAK;
-            skip_nbt(reader, legacy_named_nbt)?;
+            let nbt = read_nbt(reader, legacy_named_nbt)?;
+            if let Some(entity) = parse_block_entity(
+                chunk_x,
+                chunk_z,
+                chunk_pos_index,
+                block_entity_id,
+                nbt,
+            ) {
+                block_entities.push(entity);
+            }
+        } else if let Some(entity) = parse_block_entity(
+            chunk_x,
+            chunk_z,
+            chunk_pos_index,
+            block_entity_id,
+            None,
+        ) {
+            block_entities.push(entity);
         }
     }
 
@@ -245,12 +261,6 @@ fn read_chunk(
     if version > POLAR_VERSION_USERDATA_OPT_BLOCK_ENT_NBT {
         let _ = read_byte_array(reader)?;
     }
-
-    if block_entities.is_empty() {
-        block_entities.shrink_to_fit();
-    }
-
-    let _ = min_section;
 
     Ok(ParsedChunk {
         x: chunk_x,
@@ -277,7 +287,7 @@ fn read_section(
     if read_bool(reader)? {
         return Ok(ParsedSection {
             palette: Palette::single(air),
-            sky_light: empty_light(),
+            sky_light: full_light(),
             block_light: empty_light(),
         });
     }
@@ -311,8 +321,8 @@ fn read_section(
 
     Ok(ParsedSection {
         palette,
-        sky_light: light_to_section(sky_light_content, sky_light_data),
-        block_light: light_to_section(block_light_content, block_light_data),
+        sky_light: sky_light_to_section(sky_light_content, sky_light_data),
+        block_light: block_light_to_section(block_light_content, block_light_data),
     })
 }
 
@@ -555,11 +565,19 @@ fn full_light() -> LightSection {
     vec![-1; LIGHT_SECTION_BYTES]
 }
 
-fn light_to_section(content: LightContent, data: Option<Vec<i8>>) -> LightSection {
+fn block_light_to_section(content: LightContent, data: Option<Vec<i8>>) -> LightSection {
     match content {
         LightContent::Missing | LightContent::Empty => empty_light(),
         LightContent::Full => full_light(),
         LightContent::Present => data.unwrap_or_else(empty_light),
+    }
+}
+
+fn sky_light_to_section(content: LightContent, data: Option<Vec<i8>>) -> LightSection {
+    match content {
+        LightContent::Missing | LightContent::Full => full_light(),
+        LightContent::Empty => empty_light(),
+        LightContent::Present => data.unwrap_or_else(full_light),
     }
 }
 
@@ -605,42 +623,139 @@ fn read_heightmaps(reader: &mut BinaryReader) -> Result<Vec<Option<Vec<i32>>>, P
     Ok(heightmaps)
 }
 
-fn skip_nbt(reader: &mut BinaryReader, legacy_named_nbt: bool) -> Result<(), PolarError> {
+fn parse_block_entity(
+    chunk_x: i32,
+    chunk_z: i32,
+    chunk_pos_index: i32,
+    block_entity_id: Option<String>,
+    block_entity_nbt: Option<Nbt>,
+) -> Option<BlockEntity> {
+    let position = decode_chunk_block_position(chunk_x, chunk_z, chunk_pos_index);
+    let resolved_id = resolve_block_entity_id(block_entity_id, block_entity_nbt.as_ref())?;
+
+    let mut tags = vec![
+        Nbt::string("Id", resolved_id),
+        Nbt::IntArray {
+            name: Some("Pos".to_string()),
+            value: vec![position.x(), position.y(), position.z()],
+        },
+    ];
+
+    if let Some(Nbt::Compound { value, .. }) = block_entity_nbt {
+        tags.extend(value);
+    }
+
+    let entity_nbt = Nbt::nameless_compound(tags);
+    BlockEntity::from_nbt(&entity_nbt)
+}
+
+fn resolve_block_entity_id(id: Option<String>, nbt: Option<&Nbt>) -> Option<String> {
+    if let Some(id) = id
+        && !id.is_empty()
+    {
+        return Some(normalize_block_entity_id(id));
+    }
+
+    let nbt_id = nbt.and_then(|root| {
+        root.find_tag("id")
+            .and_then(|v| v.get_string())
+            .or_else(|| root.find_tag("Id").and_then(|v| v.get_string()))
+    })?;
+
+    Some(normalize_block_entity_id(nbt_id))
+}
+
+fn normalize_block_entity_id(id: String) -> String {
+    if id.contains(':') {
+        id
+    } else {
+        format!("minecraft:{id}")
+    }
+}
+
+fn decode_chunk_block_position(chunk_x: i32, chunk_z: i32, chunk_pos_index: i32) -> Coordinates {
+    // Polar uses Minestom CoordConversion.chunkBlockIndex packing:
+    // bits 0-3: local x
+    // bits 4-26: absolute y magnitude (23 bits)
+    // bit 27: y sign (1 = negative)
+    // bits 28-31: local z
+    let local_x = chunk_pos_index & 0x0F;
+    let local_z = (chunk_pos_index >> 28) & 0x0F;
+
+    let mut y = (chunk_pos_index & 0x07FF_FFF0) >> 4;
+    if (chunk_pos_index & 0x0800_0000) != 0 {
+        y = -y;
+    }
+
+    Coordinates::new(chunk_x * 16 + local_x, y, chunk_z * 16 + local_z)
+}
+
+fn read_nbt(reader: &mut BinaryReader, legacy_named_nbt: bool) -> Result<Option<Nbt>, PolarError> {
     let tag_type = reader.read::<u8>()?;
     if tag_type == 0 {
-        return Ok(());
+        return Ok(None);
     }
 
     if legacy_named_nbt {
-        skip_nbt_name(reader)?;
+        let _ = read_nbt_name(reader)?;
     }
 
-    skip_nbt_payload(reader, tag_type)
+    Ok(Some(read_nbt_payload(reader, tag_type)?))
 }
 
-fn skip_nbt_name(reader: &mut BinaryReader) -> Result<(), PolarError> {
+fn read_nbt_name(reader: &mut BinaryReader) -> Result<String, PolarError> {
     let len = reader.read::<u16>()? as usize;
-    skip_exact(reader, len)
+    let mut bytes = vec![0u8; len];
+    read_exact(reader, &mut bytes)?;
+
+    String::from_utf8(bytes).map_err(|_| PolarError::InvalidFormat("invalid utf-8 in NBT name"))
 }
 
-fn skip_nbt_payload(reader: &mut BinaryReader, tag_type: u8) -> Result<(), PolarError> {
+fn read_nbt_payload(reader: &mut BinaryReader, tag_type: u8) -> Result<Nbt, PolarError> {
     match tag_type {
-        1 => skip_exact(reader, 1),
-        2 => skip_exact(reader, 2),
-        3 => skip_exact(reader, 4),
-        4 => skip_exact(reader, 8),
-        5 => skip_exact(reader, 4),
-        6 => skip_exact(reader, 8),
+        1 => Ok(Nbt::Byte {
+            name: None,
+            value: reader.read::<i8>()?,
+        }),
+        2 => Ok(Nbt::Short {
+            name: None,
+            value: reader.read::<i16>()?,
+        }),
+        3 => Ok(Nbt::Int {
+            name: None,
+            value: reader.read::<i32>()?,
+        }),
+        4 => Ok(Nbt::Long {
+            name: None,
+            value: reader.read::<i64>()?,
+        }),
+        5 => Ok(Nbt::Float {
+            name: None,
+            value: reader.read::<f32>()?,
+        }),
+        6 => Ok(Nbt::Double {
+            name: None,
+            value: reader.read::<f64>()?,
+        }),
         7 => {
             let len = reader.read::<i32>()?;
             if len < 0 {
                 return Err(PolarError::InvalidFormat("negative NBT byte array length"));
             }
-            skip_exact(reader, len as usize)
+
+            let mut values = Vec::with_capacity(len as usize);
+            for _ in 0..len {
+                values.push(reader.read::<i8>()?);
+            }
+
+            Ok(Nbt::ByteArray {
+                name: None,
+                value: values,
+            })
         }
         8 => {
-            let len = reader.read::<u16>()? as usize;
-            skip_exact(reader, len)
+            let value = read_nbt_name(reader)?;
+            Ok(Nbt::String { name: None, value })
         }
         9 => {
             let list_type = reader.read::<u8>()?;
@@ -649,53 +764,126 @@ fn skip_nbt_payload(reader: &mut BinaryReader, tag_type: u8) -> Result<(), Polar
                 return Err(PolarError::InvalidFormat("negative NBT list length"));
             }
 
+            let mut values = Vec::with_capacity(len as usize);
             for _ in 0..len {
-                skip_nbt_payload(reader, list_type)?;
+                values.push(read_nbt_payload(reader, list_type)?);
             }
-            Ok(())
+
+            Ok(Nbt::List {
+                name: None,
+                value: values,
+                tag_type: list_type,
+            })
         }
         10 => {
+            let mut values = Vec::new();
             loop {
                 let entry_type = reader.read::<u8>()?;
                 if entry_type == 0 {
                     break;
                 }
-                skip_nbt_name(reader)?;
-                skip_nbt_payload(reader, entry_type)?;
+
+                let entry_name = read_nbt_name(reader)?;
+                let entry = nbt_with_name(read_nbt_payload(reader, entry_type)?, entry_name);
+                values.push(entry);
             }
-            Ok(())
+
+            Ok(Nbt::Compound {
+                name: None,
+                value: values,
+            })
         }
         11 => {
             let len = reader.read::<i32>()?;
             if len < 0 {
                 return Err(PolarError::InvalidFormat("negative NBT int array length"));
             }
-            skip_exact(reader, len as usize * 4)
+
+            let mut values = Vec::with_capacity(len as usize);
+            for _ in 0..len {
+                values.push(reader.read::<i32>()?);
+            }
+
+            Ok(Nbt::IntArray {
+                name: None,
+                value: values,
+            })
         }
         12 => {
             let len = reader.read::<i32>()?;
             if len < 0 {
                 return Err(PolarError::InvalidFormat("negative NBT long array length"));
             }
-            skip_exact(reader, len as usize * 8)
+
+            let mut values = Vec::with_capacity(len as usize);
+            for _ in 0..len {
+                values.push(reader.read::<i64>()?);
+            }
+
+            Ok(Nbt::LongArray {
+                name: None,
+                value: values,
+            })
         }
         _ => Err(PolarError::InvalidFormat("unsupported NBT tag type")),
     }
 }
 
-fn skip_exact(reader: &mut BinaryReader, mut len: usize) -> Result<(), PolarError> {
-    let mut scratch = [0u8; 1024];
-
-    while len > 0 {
-        let step = len.min(scratch.len());
-        let read = reader.read_bytes(&mut scratch[..step])?;
-        if read == 0 {
-            return Err(PolarError::BinaryReader(BinaryReaderError::UnexpectedEof));
-        }
-        len -= read;
+fn nbt_with_name(tag: Nbt, name: String) -> Nbt {
+    match tag {
+        Nbt::End => Nbt::End,
+        Nbt::Byte { value, .. } => Nbt::Byte {
+            name: Some(name),
+            value,
+        },
+        Nbt::Short { value, .. } => Nbt::Short {
+            name: Some(name),
+            value,
+        },
+        Nbt::Int { value, .. } => Nbt::Int {
+            name: Some(name),
+            value,
+        },
+        Nbt::Long { value, .. } => Nbt::Long {
+            name: Some(name),
+            value,
+        },
+        Nbt::Float { value, .. } => Nbt::Float {
+            name: Some(name),
+            value,
+        },
+        Nbt::Double { value, .. } => Nbt::Double {
+            name: Some(name),
+            value,
+        },
+        Nbt::ByteArray { value, .. } => Nbt::ByteArray {
+            name: Some(name),
+            value,
+        },
+        Nbt::String { value, .. } => Nbt::String {
+            name: Some(name),
+            value,
+        },
+        Nbt::List {
+            value, tag_type, ..
+        } => Nbt::List {
+            name: Some(name),
+            value,
+            tag_type,
+        },
+        Nbt::Compound { value, .. } => Nbt::Compound {
+            name: Some(name),
+            value,
+        },
+        Nbt::IntArray { value, .. } => Nbt::IntArray {
+            name: Some(name),
+            value,
+        },
+        Nbt::LongArray { value, .. } => Nbt::LongArray {
+            name: Some(name),
+            value,
+        },
     }
-
-    Ok(())
 }
 
 fn read_exact(reader: &mut BinaryReader, mut buf: &mut [u8]) -> Result<(), PolarError> {
